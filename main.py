@@ -15,39 +15,33 @@ import os
 import sys  # Add this import
 import torch.multiprocessing as mp
 from torch.multiprocessing import freeze_support
+from torch.cuda.amp import autocast, GradScaler
 import torch.cuda.amp as amp
+import math
+from scipy.spatial import distance as dist
+
+# Suppress pygame welcome message
+os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 
 # Replace the existing GPU check code
 def setup_device():
     if not torch.cuda.is_available():
-        print("CUDA is not available. Using CPU...")
         return torch.device('cpu')
     
     try:
         device = torch.device('cuda')
-        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
-        print(f"PyTorch version: {torch.__version__}")
-        print(f"CUDA version: {torch.cuda.get_device_capability()}")
         torch.backends.cudnn.benchmark = True
         return device
     except Exception as e:
-        print(f"GPU initialization failed: {e}")
         return torch.device('cpu')
 
 # Use this function to get device
 device = setup_device()
 
-# Add this debug information
-print(f"PyTorch version: {torch.__version__}")
-print(f"CUDA available: {torch.cuda.is_available()}")
-if torch.cuda.is_available():
-    print(f"CUDA version: {torch.cuda.get_device_capability()}")
-    print(f"GPU Device: {torch.cuda.get_device_name(0)}")
-    print(f"GPU Memory Usage:")
-    print(f"Allocated: {torch.cuda.memory_allocated(0) / 1024**2:.2f} MB")
-    print(f"Cached: {torch.cuda.memory_reserved(0) / 1024**2:.2f} MB")
+# Remove redundant debug prints and just keep one status message
+print(f"Using device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
 
-# Add after your imports
+# Clear CUDA cache once
 torch.cuda.empty_cache()
 
 # ======================
@@ -171,8 +165,8 @@ def train_epoch():
         
         optimizer.zero_grad(set_to_none=True)
         
-        # Updated autocast usage
-        with amp.autocast():
+        # Updated autocast usage to avoid warnings
+        with autocast(enabled=torch.cuda.is_available()):
             outputs = model(inputs).squeeze()
             loss = criterion(outputs, labels)
         
@@ -208,6 +202,34 @@ def validate():
     
     return val_loss / len(val_loader), correct / total
 
+# Add these constants after existing ones
+HEAD_POSE_THRESH = 30  # degrees
+GAZE_THRESH = 0.3  # normalized distance from center
+ATTENTION_FRAMES = 20  # consecutive frames to trigger alarm
+
+# Add these helper functions before main()
+def get_head_pose(shape):
+    """Calculate approximate head pose from facial landmarks"""
+    # Get nose, chin and side points
+    nose = shape[30]
+    left = shape[0]
+    right = shape[16]
+    
+    # Calculate angle from face orientation
+    dx = right[0] - left[0]
+    dy = right[1] - left[1]
+    face_angle = math.degrees(math.atan2(dy, dx))
+    
+    return abs(face_angle)
+
+def check_gaze(eye_points, frame_center, frame):
+    """Check if gaze is centered based on eye position"""
+    eye_center = np.mean(eye_points, axis=0)
+    dist_from_center = dist.euclidean(eye_center, frame_center)
+    # Normalize by frame size
+    normalized_dist = dist_from_center / (frame.shape[1] / 2)
+    return normalized_dist
+
 def main():
     global model, detector, predictor  # Add if needed
 
@@ -240,8 +262,19 @@ def main():
 
     # Detection system setup and loop
     # Initialize alarm
-    mixer.init()
-    alarm = mixer.Sound(r"G:\IITKAL\alarm.wav.wav")
+    try:
+        mixer.init()
+        alarm_path = r"G:\IITKAL\alarm.wav.wav"
+        if not os.path.exists(alarm_path):
+            print(f"Error: Alarm file not found at {alarm_path}")
+            sys.exit(1)
+        alarm = mixer.Sound(alarm_path)
+        # Test alarm
+        alarm.set_volume(1.0)  # Set volume to maximum
+        print("Alarm initialized successfully")
+    except Exception as e:
+        print(f"Error initializing alarm: {str(e)}")
+        sys.exit(1)
 
     # Dlib face detection
     SHAPE_PREDICTOR_PATH = (r"G:\IITKAL\models\shape_predictor_68_face_landmarks.dat")
@@ -279,8 +312,10 @@ def main():
     model.load_state_dict(torch.load(r"G:\IITKAL\models\eye_model.pth", map_location=device))
     model.eval()
 
-    EYE_AR_THRESH = 0.25
-    CONSECUTIVE_FRAMES = 20
+    EYE_AR_THRESH = 0.2  # Decreased from 0.25
+    HEAD_POSE_THRESH = 45  # Increased from 30
+    GAZE_THRESH = 0.4  # Increased from 0.3
+    CONSECUTIVE_FRAMES = 25  # Increased from 20 for fewer false positives
     COUNTER = 0
     ALARM_ON = False
 
@@ -292,6 +327,7 @@ def main():
             if not ret:
                 break
 
+            frame_center = np.array([frame.shape[1]/2, frame.shape[0]/2])
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             faces = detector(gray)
 
@@ -336,11 +372,56 @@ def main():
                 cv2.putText(frame, f"CNN: {left_pred:.2f}|{right_pred:.2f}", (10, 90),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
 
+                # Head pose and gaze direction
+                head_pose = get_head_pose(landmarks)
+                gaze_left = check_gaze(left_eye, frame_center=(frame.shape[1]//2, frame.shape[0]//2), frame=frame)
+                gaze_right = check_gaze(right_eye, frame_center=(frame.shape[1]//2, frame.shape[0]//2), frame=frame)
+
+                # Combined drowsiness and attention check
+                is_drowsy = ear < EYE_AR_THRESH and (left_pred < 0.5 and right_pred < 0.5)  # Changed from 'or' to 'and'
+                is_distracted = (head_pose > HEAD_POSE_THRESH and  # Changed from 'or' to 'and'
+                               (gaze_left > GAZE_THRESH or gaze_right > GAZE_THRESH))
+
+                if is_drowsy or is_distracted:
+                    COUNTER += 1
+                    if COUNTER >= CONSECUTIVE_FRAMES:  # Only trigger after consistent detection
+                        if not ALARM_ON:
+                            ALARM_ON = True
+                            try:
+                                alarm.stop()
+                                alarm.play(loops=-1)
+                                print("Alarm triggered")
+                            except Exception as e:
+                                print(f"Error playing alarm: {str(e)}")
+                        
+                        if is_drowsy:
+                            cv2.putText(frame, "DROWSINESS ALERT!", (10, 30),
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+                        if is_distracted:
+                            cv2.putText(frame, "ATTENTION ALERT!", (10, 60),
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,0,0), 2)
+                else:
+                    COUNTER = max(0, COUNTER - 1)  # Gradually decrease counter
+                    if COUNTER == 0 and ALARM_ON:
+                        ALARM_ON = False
+                        alarm.stop()
+
+                # Display debug info
+                cv2.putText(frame, f"EAR: {ear:.2f}", (10, 90),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+                cv2.putText(frame, f"Head: {head_pose:.1f}", (10, 120),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+                cv2.putText(frame, f"Gaze L/R: {gaze_left:.2f}/{gaze_right:.2f}", (10, 150),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+
             cv2.imshow('Drowsiness Detection', frame)
             if cv2.waitKey(1) == ord('q'):
                 break
     finally:
         # Cleanup
+        if 'alarm' in locals():
+            alarm.stop()
+        mixer.quit()
         cap.release()
         cv2.destroyAllWindows()
         torch.cuda.empty_cache()  # Clear GPU memory
@@ -348,4 +429,3 @@ def main():
 if __name__ == '__main__':
     freeze_support()
     main()
-    ##ilove this project
