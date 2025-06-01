@@ -1,7 +1,5 @@
 import cv2
 import dlib
-import numpy 
-import dlib
 import numpy as np
 import torch
 import torch.nn as nn
@@ -16,33 +14,47 @@ import sys  # Add this import
 import torch.multiprocessing as mp
 from torch.multiprocessing import freeze_support
 from torch.cuda.amp import autocast, GradScaler
-import torch.cuda.amp as amp
+from torch.cuda import amp
 import math
 from scipy.spatial import distance as dist
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, classification_report
+import seaborn as sns
 
 # Suppress pygame welcome message
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 
-# Replace the existing GPU check code
+# Add CUDA configuration check function first
+def check_cuda_config():
+    """Check CUDA configuration and availability"""
+    if torch.cuda.is_available():
+        return True
+    return False
+
 def setup_device():
-    if not torch.cuda.is_available():
+    """Setup computing device (GPU/CPU)"""
+    if not check_cuda_config():
+        print("WARNING: CUDA not available, using CPU")
         return torch.device('cpu')
     
     try:
-        device = torch.device('cuda')
+        device = torch.device('cuda:0')  # Explicitly select first GPU
         torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.enabled = True
         return device
     except Exception as e:
+        print(f"Error setting up CUDA: {str(e)}")
         return torch.device('cpu')
 
-# Use this function to get device
+# Initialize device
 device = setup_device()
 
-# Remove redundant debug prints and just keep one status message
-print(f"Using device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
-
-# Clear CUDA cache once
+# Clear CUDA cache
 torch.cuda.empty_cache()
+
+# Reset GPU memory stats if using CUDA
+if torch.cuda.is_available():
+    torch.cuda.reset_peak_memory_stats()
 
 # ======================
 # Part 1: Model Training
@@ -141,7 +153,7 @@ val_loader = DataLoader(
 
 # Train model
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = EyeModel().to(device)
+model = EyeModel().cuda()  # Use .cuda() explicitly
 criterion = nn.BCEWithLogitsLoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
@@ -156,17 +168,17 @@ scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
 # Replace the existing training function with this updated version
 def train_epoch():
     model.train()
-    running_loss = 0.0
+    running_loss = 0.0  # Initialize running_loss here
     scaler = amp.GradScaler() if torch.cuda.is_available() else None
     
     for inputs, labels in train_loader:
-        inputs = inputs.to(device, non_blocking=True)
-        labels = labels.float().to(device, non_blocking=True)
+        inputs = inputs.cuda(non_blocking=True)
+        labels = labels.cuda(non_blocking=True).float()
         
         optimizer.zero_grad(set_to_none=True)
         
-        # Updated autocast usage to avoid warnings
-        with autocast(enabled=torch.cuda.is_available()):
+        # Use updated autocast to avoid warning
+        with amp.autocast():
             outputs = model(inputs).squeeze()
             loss = criterion(outputs, labels)
         
@@ -191,8 +203,8 @@ def validate():
     total = 0
     
     for inputs, labels in val_loader:
-        inputs = inputs.to(device, non_blocking=True)
-        labels = labels.float().to(device, non_blocking=True)
+        inputs = inputs.cuda(non_blocking=True)
+        labels = labels.cuda(non_blocking=True).float()
         outputs = model(inputs).squeeze()
         val_loss += criterion(outputs, labels).item()
         
@@ -206,6 +218,29 @@ def validate():
 HEAD_POSE_THRESH = 30  # degrees
 GAZE_THRESH = 0.3  # normalized distance from center
 ATTENTION_FRAMES = 20  # consecutive frames to trigger alarm
+GAZE_HISTORY_LENGTH = 30  # Number of frames to track gaze history
+DISTRACTION_THRESHOLD = 0.7  # Percentage of frames with distracted gaze to trigger alert
+HEAD_ROTATION_THRESH = 45  # Maximum allowed head rotation in degrees
+PHONE_CONF_THRESH = 0.5  # Confidence threshold for phone detection
+
+# Add this function for phone detection
+def detect_phone(frame):
+    """Detect phone in hand using pre-trained model"""
+    # For demonstration, using a simplified color-based detection
+    # In production, use a proper object detection model (YOLO/SSD)
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    
+    # Detect high contrast regions (potential phone screens)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    thresh = cv2.threshold(blur, 200, 255, cv2.THRESH_BINARY)[1]
+    
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if 1000 < area < 20000:  # Typical phone screen size in pixels
+            return True
+    return False
 
 # Add these helper functions before main()
 def get_head_pose(shape):
@@ -230,6 +265,33 @@ def check_gaze(eye_points, frame_center, frame):
     normalized_dist = dist_from_center / (frame.shape[1] / 2)
     return normalized_dist
 
+def plot_training_metrics(train_losses, val_losses, train_accs, val_accs):
+    epochs = range(1, len(train_losses) + 1)
+    
+    plt.figure(figsize=(12, 5))
+    
+    # Plot losses
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs, train_losses, 'b-', label='Training Loss')
+    plt.plot(epochs, val_losses, 'r-', label='Validation Loss')
+    plt.title('Training and Validation Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    
+    # Plot accuracies
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs, train_accs, 'b-', label='Training Accuracy')
+    plt.plot(epochs, val_accs, 'r-', label='Validation Accuracy')
+    plt.title('Training and Validation Accuracy')
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig('training_metrics.png')
+    plt.show()
+
 def main():
     global model, detector, predictor  # Add if needed
 
@@ -242,20 +304,46 @@ def main():
         random_state=42
     )
 
-    # ...existing training setup...
-
+    # Training metrics
+    train_losses = []
+    val_losses = []
+    train_accs = []
+    val_accs = []
+    
     # Training loop
     for epoch in range(EPOCHS):
         running_loss = train_epoch()
         val_loss, val_acc = validate()
         
+        # Calculate training accuracy
+        model.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for inputs, labels in train_loader:
+                inputs = inputs.cuda()
+                labels = labels.cuda()
+                outputs = model(inputs).squeeze()
+                preds = torch.sigmoid(outputs) > 0.5
+                correct += (preds == labels).sum().item()
+                total += labels.size(0)
+        train_acc = correct / total
+        
+        # Store metrics
+        train_losses.append(running_loss)
+        val_losses.append(val_loss)
+        train_accs.append(train_acc)
+        val_accs.append(val_acc)
+        
         scheduler.step(val_loss)
         
         print(f'Epoch {epoch+1}/{EPOCHS}')
-        print(f'Train Loss: {running_loss:.4f}')
-        print(f'Val Loss: {val_loss:.4f}')
-        print(f'Val Acc: {val_acc:.4f}\n')
-        print(f'Current learning rate: {optimizer.param_groups[0]["lr"]}')
+        print(f'Train Loss: {running_loss:.4f}, Train Acc: {train_acc:.4f}')
+        print(f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}')
+        print(f'Current learning rate: {optimizer.param_groups[0]["lr"]}\n')
+    
+    # Plot training metrics
+    plot_training_metrics(train_losses, val_losses, train_accs, val_accs)
 
     # Save model
     torch.save(model.state_dict(), r'G:\IITKAL\models\eye_model.pth')
@@ -264,13 +352,18 @@ def main():
     # Initialize alarm
     try:
         mixer.init()
-        alarm_path = r"G:\IITKAL\alarm.wav.wav"
+        alarm_path = r"G:\IITKAL\alarm.wav"  # Changed from alarm.wav.wav to alarm.wav
         if not os.path.exists(alarm_path):
             print(f"Error: Alarm file not found at {alarm_path}")
             sys.exit(1)
         alarm = mixer.Sound(alarm_path)
-        # Test alarm
         alarm.set_volume(1.0)  # Set volume to maximum
+        
+        # Test alarm briefly
+        alarm.play()
+        import time
+        time.sleep(0.3)  # Play for 0.3 seconds
+        alarm.stop()
         print("Alarm initialized successfully")
     except Exception as e:
         print(f"Error initializing alarm: {str(e)}")
@@ -322,6 +415,7 @@ def main():
     cap = cv2.VideoCapture(0)
 
     try:
+        gaze_history = []  # Initialize gaze history
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -335,6 +429,7 @@ def main():
                 landmarks = predictor(gray, face)
                 landmarks = np.array([[p.x, p.y] for p in landmarks.parts()])
 
+                # Check drowsiness
                 left_eye = landmarks[42:48]
                 right_eye = landmarks[36:42]
 
@@ -428,4 +523,20 @@ def main():
 
 if __name__ == '__main__':
     freeze_support()
+    
+    # Ask user if they want to collect new data
+    collect_data = input("Do you want to collect real-time training data? (y/n): ")
+    if collect_data.lower() == 'y':
+        from data_collection import collect_realtime_data
+        realtime_data_path = collect_realtime_data()
+        print(f"Data collected in: {realtime_data_path}")
+        
+        # Combine existing and real-time datasets
+        full_dataset = torch.utils.data.ConcatDataset([
+            datasets.ImageFolder(DATASET_PATH),
+            datasets.ImageFolder(realtime_data_path)
+        ])
+    else:
+        full_dataset = datasets.ImageFolder(DATASET_PATH)
+    
     main()

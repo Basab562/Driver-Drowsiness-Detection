@@ -1,0 +1,8 @@
+final_accuracy: 0.8897
+final_precision: 0.9076
+final_recall: 0.8467
+final_f1: 0.8761
+train_losses: 0.3457
+val_losses: 0.2381
+train_accs: 0.8466
+val_accs: 0.8897
